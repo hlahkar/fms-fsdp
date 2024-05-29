@@ -16,3 +16,14 @@ def param_init_function(module):
         module.to_empty(device=torch.cuda.current_device())
         with torch.no_grad():
             module.reset_parameters()
+
+def param_init_function_hpu(module):
+    if (
+        isinstance(module, MultiHeadAttention)
+        or isinstance(module, WordEmbedding)
+        or isinstance(module, GatedLinearUnit)
+        or isinstance(module, LayerNormParameterized)
+    ):
+        module.to_empty(device='hpu')
+        with torch.no_grad():
+            module.reset_parameters()
