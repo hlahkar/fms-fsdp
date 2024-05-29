@@ -48,3 +48,6 @@ class train_config:
 
     # compile
     use_torch_compile: bool = True
+
+    # Intel Gaudi Support
+    use_hpu = False

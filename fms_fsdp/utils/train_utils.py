@@ -122,12 +122,19 @@ def train(
                 overall_throughput = int(
                     cfg.batch_size * cfg.seq_length / overall_step_time
                 )
-                reserved_mem = torch.cuda.max_memory_reserved(
-                    device=torch.cuda.current_device()
-                )
-                allocated_mem = torch.cuda.max_memory_allocated(
-                    device=torch.cuda.current_device()
-                )
+
+                if local_rank == 'hpu':
+                    from habana_frameworks.torch.hpu import memory_stats
+                    mem_stats = memory_stats()
+                    reserved_mem = mem_stats["Limit"]
+                    allocated_mem = mem_stats["MaxInUse"]
+                else:
+                    reserved_mem = torch.cuda.max_memory_reserved(
+                        device=torch.cuda.current_device()
+                    )
+                    allocated_mem = torch.cuda.max_memory_allocated(
+                        device=torch.cuda.current_device()
+                    )
 
                 print("step:", batch_idx)
                 print("loss:", current_loss)
@@ -163,7 +170,8 @@ def train(
 
             start = time.time()
             ddp_stats.zero_()
-        torch.cuda.reset_peak_memory_stats(device=torch.cuda.current_device())
+        if local_rank != 'hpu':
+            torch.cuda.reset_peak_memory_stats(device=torch.cuda.current_device())
 
         if batch_idx % cfg.checkpoint_interval == 0:
             checkpointer.save(
@@ -186,17 +194,20 @@ def setup_environ_flags():
     os.environ["NCCL_ASYNC_ERROR_HANDLING"] = str(1)
 
 
-def get_policies(cfg, rank, block):
+def get_policies(cfg, rank, block, use_hpu=False):
     """Get policies for mixed precision, wrapping, sharding, ac and param init function."""
 
     # mixed precision
-    verify_bfloat_support = (
-        torch.version.cuda
-        and torch.cuda.is_bf16_supported()
-        and packaging.version.parse(torch.version.cuda).release >= (11, 0)
-        and dist.is_nccl_available()
-        and nccl.version() >= (2, 10)
-    )
+    if use_hpu:
+        verify_bfloat_support = True
+    else:
+        verify_bfloat_support = (
+            torch.version.cuda
+            and torch.cuda.is_bf16_supported()
+            and packaging.version.parse(torch.version.cuda).release >= (11, 0)
+            and dist.is_nccl_available()
+            and nccl.version() >= (2, 10)
+        )
     if cfg.mixed_precision:
         bf16_ready = verify_bfloat_support
         if bf16_ready:
@@ -230,7 +241,10 @@ def get_policies(cfg, rank, block):
 
     # param init function
     if cfg.low_cpu_fsdp:
-        param_init_fn = param_init_function
+        if cfg.use_hpu:
+            param_init_fn = param_init_function_hpu
+        else:
+            param_init_fn = param_init_function
     else:
         param_init_fn = None
 

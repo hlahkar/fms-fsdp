@@ -21,14 +21,25 @@ from fms_fsdp.utils.train_utils import (
     train,
 )
 
+from datetime import timedelta
 
 def main(**kwargs):
     # get configs
     cfg = config.train_config()
     update_config(cfg, **kwargs)
 
+    if cfg.use_hpu:
+        import habana_frameworks.torch.core as htcore
+        import habana_frameworks.torch.distributed.hccl
+
     # ensure reproducibility
-    torch.cuda.manual_seed(cfg.seed)
+    if cfg.use_hpu:
+        torch.hpu.setDeterministic(True)
+        torch.hpu.random.manual_seed(cfg.seed)
+        torch.use_deterministic_algorithms(True)
+
+    else:
+        torch.cuda.manual_seed(cfg.seed)
     torch.manual_seed(cfg.seed)
 
     # torchrun specific
@@ -40,9 +51,13 @@ def main(**kwargs):
         print(f"--> running with these configs {cfg}")
 
     # some setups
-    setup()
-    torch.cuda.set_device(local_rank)
-    torch.cuda.empty_cache()
+    if cfg.use_hpu:
+        dist.init_process_group("hccl", timeout=timedelta(seconds=60 * 60))
+        torch.hpu.set_device(local_rank)
+    else:
+        setup()
+        torch.cuda.set_device(local_rank)
+        torch.cuda.empty_cache()
     setup_environ_flags()
 
     # get policy
@@ -53,7 +68,7 @@ def main(**kwargs):
         sharding_strategy_policy,
         apply_selective_ac,
         param_init_fn,
-    ) = get_policies(cfg, rank, block)
+    ) = get_policies(cfg, rank, block, cfg.use_hpu)
 
     # get fms model
     llama_config = get_model_config(cfg.model_variant)
@@ -79,21 +94,35 @@ def main(**kwargs):
         print("Datasets constructed!")
 
     # FSDP
-    model = FSDP(
-        model,
-        auto_wrap_policy=wrapping_policy,
-        mixed_precision=mixed_precision_policy,
-        sharding_strategy=sharding_strategy_policy,
-        use_orig_params=cfg.use_torch_compile,
-        device_id=torch.cuda.current_device(),
-        limit_all_gathers=True,
-        param_init_fn=param_init_fn,
-    )
-    # we need this post-fsdp call to avoid graph break with torch.compile, until we figure out a better solution.
-    model.rot_emb.compute_freqs_cis(
-        torch.device("cuda", torch.cuda.current_device()),
-        model.config.max_expected_seq_len,
-    )
+    if cfg.use_hpu:
+        model = FSDP(
+            model,
+            auto_wrap_policy=wrapping_policy,
+            mixed_precision=mixed_precision_policy,
+            sharding_strategy=sharding_strategy_policy,
+            use_orig_params=cfg.use_torch_compile,
+            device_id='hpu:0',
+            limit_all_gathers=True,
+            param_init_fn=param_init_fn,
+
+        )
+    else:
+        model = FSDP(
+            model,
+            auto_wrap_policy=wrapping_policy,
+            mixed_precision=mixed_precision_policy,
+            sharding_strategy=sharding_strategy_policy,
+            use_orig_params=cfg.use_torch_compile,
+            device_id=torch.cuda.current_device(),
+            limit_all_gathers=True,
+            param_init_fn=param_init_fn,
+        )
+    if not cfg.use_hpu:
+        # we need this post-fsdp call to avoid graph break with torch.compile, until we figure out a better solution.
+        model.rot_emb.compute_freqs_cis(
+            torch.device("cuda", torch.cuda.current_device()),
+            model.config.max_expected_seq_len,
+        )
 
     # fsdp activation checkpointing
     if cfg.fsdp_activation_checkpointing:
@@ -107,14 +136,25 @@ def main(**kwargs):
             print(f"--> enabling torch compile...")
         # the default accumulated_cache_size_limit=64 is not enough for 70b model, so we make it 128 here
         torch._dynamo.config.accumulated_cache_size_limit = 128
-        model = torch.compile(model)
+        if cfg.use_hpu:
+            model = torch.compile(model, backend='hpu_backend')
+        else:
+            model = torch.compile(model)
 
     # Optimizer
-    optimizer = optim.AdamW(
-        model.parameters(), lr=cfg.learning_rate, betas=(0.9, 0.95), weight_decay=0.1
-    )
+    if cfg.use_hpu:
+        from habana_frameworks.torch.hpex.optimizers import FusedAdamW
+        optimizer = FusedAdamW(
+            model.parameters(), lr=cfg.learning_rate, betas=(0.9, 0.95), weight_decay=0.1
+        )
+    else:
+        optimizer = optim.AdamW(
+            model.parameters(), lr=cfg.learning_rate, betas=(0.9, 0.95), weight_decay=0.1
+        )
 
     # optionally load from checkpoint (when continue pretraining)
+    if cfg.use_hpu:
+        local_rank = 'hpu'
     checkpointer = Checkpointer(
         cfg.ckpt_save_path, 1000, cfg.sharding_strategy, rank, local_rank
     )
@@ -142,6 +182,8 @@ def main(**kwargs):
     # Train
     if rank == 0:
         print(f"Training for {cfg.num_steps} steps")
+    if cfg.use_hpu:
+        local_rank = 'hpu'
     train(
         cfg,
         model,
