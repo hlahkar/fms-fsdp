@@ -27,6 +27,11 @@ def main(**kwargs):
     cfg = config.train_config()
     update_config(cfg, **kwargs)
 
+    if cfg.use_hpu:
+        import habana_frameworks.torch.core as htcore
+        import habana_frameworks.torch.gpu_migration
+        import habana_frameworks.torch.distributed.hccl
+
     # ensure reproducibility
     torch.cuda.manual_seed(cfg.seed)
     torch.manual_seed(cfg.seed)
@@ -89,11 +94,13 @@ def main(**kwargs):
         limit_all_gathers=True,
         param_init_fn=param_init_fn,
     )
-    # we need this post-fsdp call to avoid graph break with torch.compile, until we figure out a better solution.
-    model.rot_emb.compute_freqs_cis(
-        torch.device("cuda", torch.cuda.current_device()),
-        model.config.max_expected_seq_len,
-    )
+
+    if not cfg.use_hpu:
+        # we need this post-fsdp call to avoid graph break with torch.compile, until we figure out a better solution.
+        model.rot_emb.compute_freqs_cis(
+            torch.device("cuda", torch.cuda.current_device()),
+            model.config.max_expected_seq_len,
+        )
 
     # fsdp activation checkpointing
     if cfg.fsdp_activation_checkpointing:
@@ -110,9 +117,15 @@ def main(**kwargs):
         model = torch.compile(model)
 
     # Optimizer
-    optimizer = optim.AdamW(
-        model.parameters(), lr=cfg.learning_rate, betas=(0.9, 0.95), weight_decay=0.1
-    )
+    if cfg.use_hpu:
+        from habana_frameworks.torch.hpex.optimizers import FusedAdamW
+        optimizer = FusedAdamW(
+            model.parameters(), lr=cfg.learning_rate, betas=(0.9, 0.95), weight_decay=0.1
+        )
+    else:
+        optimizer = optim.AdamW(
+            model.parameters(), lr=cfg.learning_rate, betas=(0.9, 0.95), weight_decay=0.1
+        )
 
     # optionally load from checkpoint (when continue pretraining)
     checkpointer = Checkpointer(
