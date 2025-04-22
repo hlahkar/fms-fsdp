@@ -2,3 +2,4 @@ fire==0.5.0
 pyarrow==15.0.0
 transformers==4.40.2
 ibm-fms>=0.0.3
+triton==3.1.0
